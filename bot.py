@@ -116,7 +116,58 @@ async def delete_track(track_id: int, user_id: int) -> bool:
         return cursor.rowcount > 0
 
 
-# 3. ПАРСЕР
+# 3. СПЕЦИАЛЬНЫЙ ПАРСЕР WILDBERRIES (Через прямое API)
+async def fetch_wb_info(url: str) -> Tuple[Optional[str], Optional[float]]:
+    # Вытаскиваем артикул цифрами из ссылки
+    match = re.search(r"/catalog/(\d+)/", url) or re.search(r"nm=(\d+)", url)
+    if not match:
+        match = re.search(r"/(\d{6,})/", url)
+    if not match:
+        return None, None
+
+    article = match.group(1)
+    api_url = f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={article}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            headers=headers, timeout=10.0, follow_redirects=True
+        ) as client:
+            res = await client.get(api_url)
+            if res.status_code != 200:
+                return None, None
+
+            data = res.json()
+            products = data.get("data", {}).get("products", [])
+            if not products:
+                return None, None
+
+            prod = products[0]
+            title = prod.get("name") or f"Товар WB {article}"
+
+            # В API Wildberries цена хранится в копейках (де Fond на 100)
+            price = None
+            sizes = prod.get("sizes", [])
+            if sizes and isinstance(sizes[0], dict):
+                p_obj = sizes[0].get("price", {})
+                if isinstance(p_obj, dict) and "total" in p_obj:
+                    price = p_obj["total"] / 100.0
+
+            if price is None and "salePriceU" in prod:
+                price = prod["salePriceU"] / 100.0
+            elif price is None and "priceU" in prod:
+                price = prod["priceU"] / 100.0
+
+            return title, price
+    except Exception as e:
+        log.warning(f"Ошибка API WB: {e}")
+        return None, None
+
+
+# 4. ОБЩИЙ ПАРСЕР ДЛЯ ОСТАЛЬНЫХ САЙТОВ
 def _clean_price(raw_text: str) -> Optional[float]:
     clean = re.sub(r"[^\d.,]", "", raw_text.replace(" ", "")).replace(",", ".")
     if clean.count(".") > 1:
@@ -130,6 +181,12 @@ def _clean_price(raw_text: str) -> Optional[float]:
 
 
 async def fetch_product_info(url: str) -> Tuple[Optional[str], Optional[float]]:
+    # Если это Wildberries — сразу идём по прямому API
+    if "wildberries.ru" in url or "wb.ru" in url:
+        wb_title, wb_price = await fetch_wb_info(url)
+        if wb_price is not None:
+            return wb_title, wb_price
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -192,7 +249,7 @@ async def fetch_product_info(url: str) -> Tuple[Optional[str], Optional[float]]:
     return title, None
 
 
-# 4. КОМАНДЫ БОТА
+# 5. КОМАНДЫ БОТА
 @dp.message(CommandStart())
 async def cmd_start(msg: types.Message):
     reply = (
@@ -203,7 +260,7 @@ async def cmd_start(msg: types.Message):
         "• /list — список товаров\n"
         "• /del <ID> — удалить товар\n\n"
         "Пример:\n"
-        "/track https://example.com/item 4500"
+        "/track https://www.wildberries.ru/catalog/178008725/detail.aspx 2000"
     )
     await msg.answer(reply)
 
@@ -212,7 +269,9 @@ async def cmd_start(msg: types.Message):
 async def cmd_track(msg: types.Message):
     parts = msg.text.strip().split()
     if len(parts) < 3:
-        await msg.answer("⚠️ Формат: /track <ссылка> <цена>\nПример: /track https://site.ru/item 15000")
+        await msg.answer(
+            "⚠️ Формат: /track <ссылка> <цена>\nПример: /track https://... 1500"
+        )
         return
 
     url = parts[1]
@@ -230,16 +289,20 @@ async def cmd_track(msg: types.Message):
     title, current_price = await fetch_product_info(url)
 
     if current_price is None:
-        await wait_msg.edit_text("❌ Не удалось считать цену. Сайт может блокировать запросы.")
+        await wait_msg.edit_text(
+            "❌ Не удалось считать цену. Сайт защищён от парсинга."
+        )
         return
 
-    track_id = await add_track(msg.from_user.id, url, title, target_price, current_price)
+    track_id = await add_track(
+        msg.from_user.id, url, title, target_price, current_price
+    )
     text = (
         f"✅ Товар добавлен! (ID: {track_id})\n\n"
         f"📦 {title}\n"
-        f"💵 Текущая: {current_price:,.2f}\n"
-        f"🎯 Ждем: {target_price:,.2f}\n\n"
-        f"Как цена упадет — пришлю сообщение!"
+        f"💵 Текущая: {current_price:,.2f} ₽\n"
+        f"🎯 Ждем: {target_price:,.2f} ₽\n\n"
+        f"Как цена упадет — сразу пришлю сообщение!"
     )
     await wait_msg.edit_text(text)
 
@@ -248,15 +311,17 @@ async def cmd_track(msg: types.Message):
 async def cmd_list(msg: types.Message):
     tracks = await get_user_tracks(msg.from_user.id)
     if not tracks:
-        await msg.answer("У тебя пока нет товаров в списке. Добавь через /track.")
+        await msg.answer(
+            "У тебя пока нет товаров в списке. Добавь через /track."
+        )
         return
 
     text = "📋 Твои товары:\n\n"
     for t in tracks:
         text += (
             f"🆔 {t['id']} | {t['title']}\n"
-            f"• Текущая: {t['last_price']:,.2f}\n"
-            f"• Цель: {t['target_price']:,.2f}\n"
+            f"• Текущая: {t['last_price']:,.2f} ₽\n"
+            f"• Цель: {t['target_price']:,.2f} ₽\n"
             f"• Ссылка: {t['url']}\n"
             f"• Удалить: /del {t['id']}\n\n"
         )
@@ -278,7 +343,7 @@ async def cmd_del(msg: types.Message):
         await msg.answer(f"❌ Товар #{track_id} не найден.")
 
 
-# 5. ФОНОВЫЙ МОНИТОРИНГ
+# 6. ФОНОВЫЙ МОНИТОРИНГ
 async def monitor_worker():
     while True:
         try:
@@ -287,7 +352,6 @@ async def monitor_worker():
             if not tracks:
                 continue
 
-            log.info(f"Проверка {len(tracks)} товаров...")
             for t in tracks:
                 _, new_price = await fetch_product_info(t["url"])
                 if new_price is None:
@@ -301,11 +365,13 @@ async def monitor_worker():
                         msg_text = (
                             f"🔥 ЧЁ ПОЧЁМ: ЦЕНА УПАЛА!\n\n"
                             f"📦 {t['title']}\n"
-                            f"📉 Новая цена: {new_price:,.2f} (была: {t['last_price']:,.2f})\n"
-                            f"🎯 Твоя цель: {t['target_price']:,.2f}\n\n"
+                            f"📉 Новая цена: {new_price:,.2f} ₽ (была: {t['last_price']:,.2f} ₽)\n"
+                            f"🎯 Твоя цель: {t['target_price']:,.2f} ₽\n\n"
                             f"Ссылка: {t['url']}"
                         )
-                        await bot.send_message(chat_id=t["user_id"], text=msg_text)
+                        await bot.send_message(
+                            chat_id=t["user_id"], text=msg_text
+                        )
                     except Exception as err:
                         log.error(f"Ошибка отправки: {err}")
 
@@ -316,7 +382,7 @@ async def monitor_worker():
             log.error(f"Сбой мониторинга: {e}")
 
 
-# 6. СТАРТ
+# 7. СТАРТ
 async def main():
     if not TOKEN or ":" not in TOKEN:
         raise ValueError("Токен BOT_TOKEN не задан!")
