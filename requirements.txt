@@ -1,0 +1,6 @@
+aiogram>=3.4.1
+aiosqlite>=0.20.0
+httpx>=0.27.0
+beautifulsoup4>=4.12.3
+python-dotenv>=1.0.1
+aiohttp>=3.9.0
